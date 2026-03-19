@@ -7,7 +7,7 @@
 
 import type { Command, Result } from './protocol';
 import { DAEMON_WS_URL, WS_RECONNECT_BASE_DELAY, WS_RECONNECT_MAX_DELAY } from './protocol';
-import * as cdp from './cdp';
+import * as executor from './cdp';
 
 let ws: WebSocket | null = null;
 let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
@@ -85,6 +85,46 @@ function scheduleReconnect(): void {
   }, delay);
 }
 
+// ─── Automation window isolation ─────────────────────────────────────
+// All opencli operations happen in a dedicated Chrome window so the
+// user's active browsing session is never touched.
+
+let automationWindowId: number | null = null;
+
+/** Get or create the dedicated automation window. */
+async function getAutomationWindow(): Promise<number> {
+  // Check if our window is still alive
+  if (automationWindowId !== null) {
+    try {
+      await chrome.windows.get(automationWindowId);
+      return automationWindowId;
+    } catch {
+      // Window was closed by user
+      automationWindowId = null;
+    }
+  }
+
+  // Create a new window with about:blank (not chrome://newtab which blocks scripting)
+  const win = await chrome.windows.create({
+    url: 'about:blank',
+    focused: false,
+    width: 1280,
+    height: 900,
+    type: 'normal',
+  });
+  automationWindowId = win.id!;
+  console.log(`[opencli] Created automation window ${automationWindowId}`);
+  return automationWindowId;
+}
+
+// Clean up when the automation window is closed
+chrome.windows.onRemoved.addListener((windowId) => {
+  if (windowId === automationWindowId) {
+    console.log('[opencli] Automation window closed');
+    automationWindowId = null;
+  }
+});
+
 // ─── Lifecycle events ────────────────────────────────────────────────
 
 let initialized = false;
@@ -93,7 +133,7 @@ function initialize(): void {
   if (initialized) return;
   initialized = true;
   chrome.alarms.create('keepalive', { periodInMinutes: 0.4 }); // ~24 seconds
-  cdp.registerListeners();
+  executor.registerListeners();
   connect();
   console.log('[opencli] Browser Bridge extension initialized');
 }
@@ -145,27 +185,28 @@ function isWebUrl(url?: string): boolean {
   return !url.startsWith('chrome://') && !url.startsWith('chrome-extension://');
 }
 
-/** Resolve target tab: use specified tabId or fall back to active web page tab */
+/**
+ * Resolve target tab in the automation window.
+ * If explicit tabId is given, use that directly.
+ * Otherwise, find or create a tab in the dedicated automation window.
+ */
 async function resolveTabId(tabId?: number): Promise<number> {
   if (tabId !== undefined) return tabId;
 
-  // Try the active tab first
-  const [activeTab] = await chrome.tabs.query({ active: true, currentWindow: true });
-  if (activeTab?.id && isWebUrl(activeTab.url)) {
-    return activeTab.id;
-  }
+  // Get (or create) the automation window
+  const windowId = await getAutomationWindow();
 
-  // Active tab is not debuggable — try to find any open web page tab
-  const allTabs = await chrome.tabs.query({ currentWindow: true });
-  const webTab = allTabs.find(t => t.id && isWebUrl(t.url));
-  if (webTab?.id) {
-    await chrome.tabs.update(webTab.id, { active: true });
-    return webTab.id;
-  }
+  // Find the active tab in our automation window
+  const tabs = await chrome.tabs.query({ windowId });
+  const webTab = tabs.find(t => t.id && isWebUrl(t.url));
+  if (webTab?.id) return webTab.id;
 
-  // No web tabs at all — create one
-  const newTab = await chrome.tabs.create({ url: 'about:blank', active: true });
-  if (!newTab.id) throw new Error('Failed to create new tab');
+  // Use the first tab if it's a blank/new tab page
+  if (tabs.length > 0 && tabs[0]?.id) return tabs[0].id;
+
+  // No suitable tab — create one
+  const newTab = await chrome.tabs.create({ windowId, url: 'about:blank', active: true });
+  if (!newTab.id) throw new Error('Failed to create tab in automation window');
   return newTab.id;
 }
 
@@ -173,7 +214,7 @@ async function handleExec(cmd: Command): Promise<Result> {
   if (!cmd.code) return { id: cmd.id, ok: false, error: 'Missing code' };
   const tabId = await resolveTabId(cmd.tabId);
   try {
-    const data = await cdp.evaluateAsync(tabId, cmd.code);
+    const data = await executor.evaluateAsync(tabId, cmd.code);
     return { id: cmd.id, ok: true, data };
   } catch (err) {
     return { id: cmd.id, ok: false, error: err instanceof Error ? err.message : String(err) };
@@ -235,12 +276,12 @@ async function handleTabs(cmd: Command): Promise<Result> {
         const target = tabs[cmd.index];
         if (!target?.id) return { id: cmd.id, ok: false, error: `Tab index ${cmd.index} not found` };
         await chrome.tabs.remove(target.id);
-        cdp.detach(target.id);
+        executor.detach(target.id);
         return { id: cmd.id, ok: true, data: { closed: target.id } };
       }
       const tabId = await resolveTabId(cmd.tabId);
       await chrome.tabs.remove(tabId);
-      cdp.detach(tabId);
+      executor.detach(tabId);
       return { id: cmd.id, ok: true, data: { closed: tabId } };
     }
     case 'select': {
@@ -281,7 +322,7 @@ async function handleCookies(cmd: Command): Promise<Result> {
 async function handleScreenshot(cmd: Command): Promise<Result> {
   const tabId = await resolveTabId(cmd.tabId);
   try {
-    const data = await cdp.screenshot(tabId, {
+    const data = await executor.screenshot(tabId, {
       format: cmd.format,
       quality: cmd.quality,
       fullPage: cmd.fullPage,

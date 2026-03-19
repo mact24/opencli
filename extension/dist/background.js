@@ -168,6 +168,31 @@ function scheduleReconnect() {
 		connect();
 	}, delay);
 }
+var automationWindowId = null;
+/** Get or create the dedicated automation window. */
+async function getAutomationWindow() {
+	if (automationWindowId !== null) try {
+		await chrome.windows.get(automationWindowId);
+		return automationWindowId;
+	} catch {
+		automationWindowId = null;
+	}
+	automationWindowId = (await chrome.windows.create({
+		url: "about:blank",
+		focused: false,
+		width: 1280,
+		height: 900,
+		type: "normal"
+	})).id;
+	console.log(`[opencli] Created automation window ${automationWindowId}`);
+	return automationWindowId;
+}
+chrome.windows.onRemoved.addListener((windowId) => {
+	if (windowId === automationWindowId) {
+		console.log("[opencli] Automation window closed");
+		automationWindowId = null;
+	}
+});
 var initialized = false;
 function initialize() {
 	if (initialized) return;
@@ -213,24 +238,24 @@ function isWebUrl(url) {
 	if (!url) return false;
 	return !url.startsWith("chrome://") && !url.startsWith("chrome-extension://");
 }
-/** Resolve target tab: use specified tabId or fall back to active web page tab */
+/**
+* Resolve target tab in the automation window.
+* If explicit tabId is given, use that directly.
+* Otherwise, find or create a tab in the dedicated automation window.
+*/
 async function resolveTabId(tabId) {
 	if (tabId !== void 0) return tabId;
-	const [activeTab] = await chrome.tabs.query({
-		active: true,
-		currentWindow: true
-	});
-	if (activeTab?.id && isWebUrl(activeTab.url)) return activeTab.id;
-	const webTab = (await chrome.tabs.query({ currentWindow: true })).find((t) => t.id && isWebUrl(t.url));
-	if (webTab?.id) {
-		await chrome.tabs.update(webTab.id, { active: true });
-		return webTab.id;
-	}
+	const windowId = await getAutomationWindow();
+	const tabs = await chrome.tabs.query({ windowId });
+	const webTab = tabs.find((t) => t.id && isWebUrl(t.url));
+	if (webTab?.id) return webTab.id;
+	if (tabs.length > 0 && tabs[0]?.id) return tabs[0].id;
 	const newTab = await chrome.tabs.create({
+		windowId,
 		url: "about:blank",
 		active: true
 	});
-	if (!newTab.id) throw new Error("Failed to create new tab");
+	if (!newTab.id) throw new Error("Failed to create tab in automation window");
 	return newTab.id;
 }
 async function handleExec(cmd) {

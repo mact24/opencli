@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "opencli Browser Bridge",
-  "version": "1.0.0",
+  "version": "0.2.0",
   "description": "Bridge between opencli CLI and your browser — execute commands, read cookies, manage tabs.",
   "permissions": [
     "debugger",
@@ -9,6 +9,9 @@
     "cookies",
     "activeTab",
     "alarms"
+  ],
+  "host_permissions": [
+    "<all_urls>"
   ],
   "background": {
     "service_worker": "dist/background.js",

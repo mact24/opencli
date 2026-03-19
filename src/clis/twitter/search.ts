@@ -13,21 +13,59 @@ cli({
   ],
   columns: ['id', 'author', 'text', 'likes', 'views', 'url'],
   func: async (page, kwargs) => {
-    // 1. Navigate directly to the search page
-    const q = encodeURIComponent(kwargs.query);
-    await page.goto(`https://x.com/search?q=${q}&f=top`);
+    const query = kwargs.query;
+
+    // 1. Navigate to x.com/explore (has a search input at the top)
+    await page.goto('https://x.com/explore');
     await page.wait(3);
 
-    // 2. Install interceptor after page load (must be after goto, not before,
-    //    because goto triggers a full navigation that resets the JS context).
-    //    Note: this misses the initial SearchTimeline request fired during
-    //    hydration; we rely on scroll-triggered pagination to capture data.
+    // 2. Install interceptor BEFORE triggering search.
+    //    SPA navigation preserves the JS context, so the monkey-patched
+    //    fetch will capture the SearchTimeline API call.
     await page.installInterceptor('SearchTimeline');
 
-    // 3. Scroll to trigger SearchTimeline API calls (pagination)
-    await page.autoScroll({ times: 3, delayMs: 2000 });
-    
-    // 4. Retrieve data
+    // 3. Use the search input to submit the query (SPA, no full reload).
+    //    Find the search input, type the query, and submit.
+    await page.evaluate(`
+      (() => {
+        const input = document.querySelector('input[data-testid="SearchBox_Search_Input"]');
+        if (!input) throw new Error('Search input not found');
+        input.focus();
+        const nativeSetter = Object.getOwnPropertyDescriptor(
+          HTMLInputElement.prototype, 'value'
+        ).set;
+        nativeSetter.call(input, ${JSON.stringify(query)});
+        input.dispatchEvent(new Event('input', { bubbles: true }));
+      })()
+    `);
+    await page.wait(0.5);
+    // Press Enter to submit
+    await page.evaluate(`
+      (() => {
+        const input = document.querySelector('input[data-testid="SearchBox_Search_Input"]');
+        if (!input) throw new Error('Search input not found');
+        input.dispatchEvent(new KeyboardEvent('keydown', { key: 'Enter', code: 'Enter', keyCode: 13, bubbles: true }));
+      })()
+    `);
+    await page.wait(5);
+
+    // 4. Click "Top" tab if available (ensures we get top results)
+    try {
+      await page.evaluate(`
+        (() => {
+          const tabs = document.querySelectorAll('[role="tab"]');
+          for (const tab of tabs) {
+            if (tab.textContent.trim() === 'Top') { tab.click(); break; }
+          }
+        })()
+      `);
+      await page.wait(2);
+    } catch { /* ignore if tab not found */ }
+
+    // 5. Scroll to trigger additional pagination
+    await page.autoScroll({ times: 2, delayMs: 2000 });
+
+    // 6. Retrieve captured data
     const requests = await page.getInterceptedRequests();
     if (!requests || requests.length === 0) return [];
 
@@ -35,7 +73,7 @@ cli({
     const seen = new Set<string>();
     for (const req of requests) {
       try {
-        const insts = req.data?.data?.search_by_raw_query?.search_timeline?.timeline?.instructions || [];
+        const insts = req?.data?.search_by_raw_query?.search_timeline?.timeline?.instructions || [];
         const addEntries = insts.find((i: any) => i.type === 'TimelineAddEntries')
           || insts.find((i: any) => i.entries && Array.isArray(i.entries));
         if (!addEntries?.entries) continue;
