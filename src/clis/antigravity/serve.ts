@@ -81,8 +81,27 @@ function sleep(ms: number): Promise<void> {
   return new Promise(resolve => setTimeout(resolve, ms));
 }
 
+// ─── DOM helpers ─────────────────────────────────────────────────────
+
+/**
+ * Walk from the scroll container and find the deepest element that
+ * has multiple non-empty children (our message container).
+ */
+function findMessageContainer(root: Element | null, depth = 0): Element | null {
+  if (!root || depth > 12) return null;
+  const nonEmpty = Array.from(root.children).filter(
+    c => (c as HTMLElement).innerText?.trim().length > 5
+  );
+  if (nonEmpty.length >= 2) return root;
+  if (nonEmpty.length === 1) return findMessageContainer(nonEmpty[0], depth + 1);
+  return root;
+}
+
 // ─── Antigravity CDP Operations ──────────────────────────────────────
 
+/**
+ * Get the full chat text for change-detection polling.
+ */
 async function getConversationText(page: IPage): Promise<string> {
   const text = await page.evaluate(`
     (() => {
@@ -92,6 +111,52 @@ async function getConversationText(page: IPage): Promise<string> {
       // skipping UI chrome like file change panels, model selectors, etc.
       const chatContent = container.children[0];
       return chatContent ? chatContent.innerText : container.innerText;
+    })()
+  `);
+  return String(text ?? '');
+}
+
+/**
+ * Get the text of the last assistant reply by navigating to the message container
+ * and extracting the last non-empty message block.
+ * Based on DOM structure: messages are siblings inside a container with empty className.
+ */
+async function getLastAssistantReply(page: IPage): Promise<string> {
+  const text = await page.evaluate(`
+    (() => {
+      const conv = document.getElementById('conversation')?.children[0];
+      const scroll = conv?.querySelector('.overflow-y-auto');
+      
+      // Walk down until we find a container with multiple message siblings
+      function findMsgContainer(el, depth) {
+        if (!el || depth > 12) return null;
+        const nonEmpty = Array.from(el.children).filter(c => c.innerText && c.innerText.trim().length > 5);
+        if (nonEmpty.length >= 2) return el;
+        if (nonEmpty.length === 1) return findMsgContainer(nonEmpty[0], depth + 1);
+        return null;
+      }
+      
+      const container = findMsgContainer(scroll || conv, 0);
+      if (!container) return '';
+      
+      // Get all non-empty children (skip trailing empty UI divs)
+      const msgs = Array.from(container.children).filter(
+        c => c.innerText && c.innerText.trim().length > 5
+      );
+      
+      if (msgs.length === 0) return '';
+      
+      // The last element is the last assistant reply
+      const last = msgs[msgs.length - 1];
+      
+      // Strip leading "Thought for Xs" thinking block if present
+      let text = last.innerText || '';
+      text = text.replace(/^Thought for [^\\n]*\\n+/i, '').trim();
+      
+      // Strip "Copy" button text at the end (it's often appended by Antigravity UI)
+      text = text.replace(/\\s*Copy\\s*$/, '').trim();
+      
+      return text;
     })()
   `);
   return String(text ?? '');
@@ -238,9 +303,12 @@ async function handleMessages(
   console.error(`[serve] Sending: "${userText.slice(0, 80)}${userText.length > 80 ? '...' : ''}"`);
   await sendMessage(page, userText, bridge);
 
-  // Poll for reply
+  // Poll for reply (change detection)
   console.error('[serve] Waiting for reply...');
-  const replyText = await waitForReply(page, beforeText);
+  await waitForReply(page, beforeText);
+
+  // Extract the actual reply text precisely from the DOM
+  const replyText = await getLastAssistantReply(page);
   console.error(`[serve] Got reply: "${replyText.slice(0, 80)}${replyText.length > 80 ? '...' : ''}"`);
 
   return {
